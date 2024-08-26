@@ -1,19 +1,36 @@
-library(tibble)
-library(tidybayes)
-library(tidyr)
-library(dplyr)
-library(brms)
-library(psych)
-library(faintr)
+# packages for Bayesian regression modelling
+library(brms)      
+# install faintr from Github (easy evaluation of brm models)
+#devtools::install_github("michael-franke/faintr")
+
+# for data wrangling 
+library(tibble)     # dataframes
+library(tidyr)      # for tidying dataframes
+library(dplyr)      # intuitive data manipulation
+
+# for plotting
+library(ggplot2)    # for plots
+
+
+# option for Bayesian regression models: 
+# use all available cores for parallel computing
+options(mc.cores = parallel::detectCores())
+
+# seeding for reproducibility
+set.seed(123)
 
 #### helper functions
 
+#' function to compare posteriors of two conditions 
+#' returns a dataframe with the means and CIs of both conditions, as well as
+#' their difference
 summarize_posterior <- function(post_do0, post_do1, 
                                 label_do0 = "refuse drug",
                                 label_do1 = "take drug") {
   
-  # Ensure the inputs are tibbles (this is ugly but necessary to ensure the 
-  # function can handle tibbles and normal lists as input
+  # Ensure the inputs are tibbles and the columns are named "value"  
+  # (this is ugly but necessary to ensure the 
+  # function can handle tibbles and normal lists as input)
   post_do0 <- tibble(value = pull(as_tibble(post_do0)))
   post_do1 <- tibble(value = pull(as_tibble(post_do1)))
   
@@ -45,7 +62,6 @@ summarize_posterior <- function(post_do0, post_do1,
   return(post_sum)
   
 }
-
 
 
 
@@ -98,8 +114,7 @@ fit_recovery_gender <- brm(
 # sample from estimated gender dist
 # why? because for the do(treatment) operation, we make gender 
 # independent from treatment (remove causal connection)
-# in the formula: we no longer compute P(G=g|D=d), but only 
-# P(G=g)
+# in the formula: we no longer compute P(G=g|D=d), but only P(G=g)
 posterior_gender_sample <- tidybayes::predicted_draws(
   # predicted_draws draws from posterior predictive dist
   # P(y_new | x_new, y_obs), because we want data points
@@ -135,19 +150,15 @@ posterior_DrugRefused_g <- tidybayes::epred_draws(
   select(refused)
 
 # summarize results 
-summarize_posterior(posterior_DrugRefused_g, posterior_DrugTaken_g)
+post_sum_g <- summarize_posterior(posterior_DrugRefused_g, posterior_DrugTaken_g)
 
 
 
 #### Causal inference with blood pressure as mediator
-# in this formula, we ignore bp alltogether. We assume that bp is either fully 
-# determined by drug intake, therefore all changes in bp depend on the drug
-# and we can ignore the effect of bp on recovery. Or, if bp is not only dependent
-# on drug intake, and has other causes, we assume these causes to be independent
-# from drug intake, and therefore equally distributed between the drug and placebo
-# groups. This means that if we find a significant difference of recovery rates 
-# between the drug and placebo groups, this difference can only be explained by 
-# drug intake
+
+#' in this formula, we ignore bp alltogether, because we only care about the 
+#' total causal effect that the drug has on recovery, independent of whether 
+#' this effect occurrs directly or via the change in bp
 fit_recovery_bp <- brm(
   formula = recover ~ drug,
   data = data_SP_long,
@@ -158,24 +169,77 @@ fit_recovery_bp <- brm(
 posterior_DrugTaken_bp <-
   faintr::filter_cell_draws(fit_recovery_bp, drug == "Take") |>
   pull(draws) |>
-  logistic()
+  psych::logistic() |>
+  # transform to tibble
+  (\(.) tibble(taken=.))()
 
 
 posterior_DrugRefused_bp <-
   faintr::filter_cell_draws(fit_recovery_bp, drug == "Refuse") |>
   pull(draws) |>
-  logistic()
+  psych::logistic() |>
+  # transform to tibble
+  (\(.) tibble(refused=.))()
 
 
+# summarize results 
+post_sum_bp <- summarize_posterior(posterior_DrugRefused_bp, posterior_DrugTaken_bp)
 
 
+# compute posteriors of causal effect by subtracting DrugRefused from DrugTaken
+posterior_effect_g <- posterior_DrugTaken_g - posterior_DrugRefused_g
+posterior_effect_bp <- posterior_DrugTaken_bp - posterior_DrugRefused_bp
 
+# plot posteriors
+p <- ggplot() + 
+  geom_vline(aes(xintercept = 0),
+             linetype = "dashed",
+             color = "darkgrey") +
+  # mean lines
+  #geom_vline(aes(xintercept = post_sum_g$mean[3]),
+  #           color = "darkgrey") +
+  #geom_vline(aes(xintercept = post_sum_bp$mean[3]),
+  #           color = "darkgrey") +
+  # gender
+  geom_density(data=posterior_effect_g, 
+               mapping = aes(x=taken,
+                             color = "darkred"), 
+               kernel="gaussian",
+               linewidth = 1,
+               key_glyph = "path") +
+  # blood pressure
+  geom_density(data=posterior_effect_bp, 
+               mapping = aes(x=taken,
+                             color ="darkorange"), 
+               kernel="gaussian",
+               linewidth = 1,
+               key_glyph = "path") +
+  # CIs
+  geom_segment(aes(x = post_sum_g$CI_lower[3],
+                   xend = post_sum_g$CI_upper[3],
+                   y = 1.5, yend = 1.5),
+               linewidth = 1) +
+  geom_segment(aes(x = post_sum_bp$CI_lower[3],
+                   xend = post_sum_bp$CI_upper[3],
+                   y = 3, yend = 3),
+               linewidth = 1) +
+  # mean points
+  geom_point(aes(x = post_sum_g$mean[3], y=1.5)) +
+  geom_point(aes(x = post_sum_bp$mean[3], y=3)) +
+  # design
+  theme_classic() +
+  theme(legend.position.inside = c(0.8, 0.8)) +
+  labs(x = "causal effect",
+       y = "density") +
+  guides(color=guide_legend(title=NULL,
+                            position = "inside")) +
+  scale_color_identity(guide = "legend",
+                       labels = c("Gender as \n confound",
+                                  "Blood pressure \n as mediator")) 
 
-
-
-
-
-
+# save figure
+ggsave(plot = last_plot(), filename = "posterior_causal_effect.png",
+       width = 6, height = 4)
 
 
 
